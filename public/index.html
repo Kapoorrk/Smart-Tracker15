@@ -383,7 +383,7 @@
       <div class="card">
         <div class="card-title">Database Info</div>
         <p style="font-size:14px;color:var(--text2);line-height:1.7;">
-          Your expenses are stored in a <strong>PostgreSQL</strong> database hosted on Render.<br/>
+          Your expenses are stored in a <strong>MongoDB</strong> database hosted on Atlas.<br/>
           All data is persistent, secure, and accessible from any device.
         </p>
         <div id="db-info" style="margin-top:1rem;font-family:'DM Mono',monospace;font-size:13px;color:var(--text3);background:var(--surface2);padding:1rem;border-radius:var(--radius);">
@@ -637,7 +637,7 @@ async function checkDB() {
     const d = await r.json();
     setDBStatus(d.success);
     if (d.success) {
-      document.getElementById('db-info').textContent = `Status: Connected ✓\nEngine: PostgreSQL\nHost: Render Cloud\nMonth loaded: ${currentMonth}`;
+      document.getElementById('db-info').textContent = `Status: Connected ✓\nEngine: MongoDB\nHost: MongoDB Atlas\nMonth loaded: ${currentMonth}`;
     }
   } catch(e) { setDBStatus(false); }
 }
