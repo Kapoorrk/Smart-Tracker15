@@ -1,12 +1,12 @@
 require("dotenv").config();
 const express = require("express");
-const { Pool } = require("pg");
+const mongoose = require("mongoose");
 const cors = require("cors");
 const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const isDev = !process.env.DATABASE_URL;
+const isDev = !process.env.MONGODB_URI;
 
 // ── Middleware ──────────────────────────────────────────────────────────────
 app.use(cors());
@@ -35,17 +35,24 @@ let mockExpenses = [
 let mockSettings = {};
 let nextId = 3;
 
-// ── DB Connection (Production) ──────────────────────────────────────────────
-let pool;
-if (process.env.DATABASE_URL) {
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl:
-      process.env.NODE_ENV === "production"
-        ? { rejectUnauthorized: false }
-        : false,
-  });
-}
+// ── Mongoose Models (Production) ──────────────────────────────────────────────
+// Define Schema for Expenses
+const expenseSchema = new mongoose.Schema({
+  description: { type: String, required: true },
+  amount: { type: Number, required: true },
+  category: { type: String, default: 'Other' },
+  expense_date: { type: String, default: () => new Date().toISOString().split("T")[0] },
+  created_at: { type: Date, default: Date.now }
+});
+const Expense = mongoose.model('Expense', expenseSchema);
+
+// Define Schema for Settings
+const settingSchema = new mongoose.Schema({
+  key: { type: String, required: true, unique: true },
+  value: { type: String, required: true },
+  updated_at: { type: Date, default: Date.now }
+});
+const Setting = mongoose.model('Setting', settingSchema);
 
 // ── Init DB ─────────────────────────────────────────────────────────────────
 async function initDB() {
@@ -54,24 +61,13 @@ async function initDB() {
     return;
   }
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS expenses (
-      id SERIAL PRIMARY KEY,
-      description TEXT NOT NULL,
-      amount NUMERIC(12,2) NOT NULL,
-      category VARCHAR(50) NOT NULL DEFAULT 'Other',
-      expense_date DATE NOT NULL DEFAULT CURRENT_DATE,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS settings (
-      id SERIAL PRIMARY KEY,
-      key VARCHAR(100) UNIQUE NOT NULL,
-      value TEXT NOT NULL,
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-  console.log("✅ DB tables ready");
+  try {
+    await mongoose.connect(process.env.MONGODB_URI);
+    console.log("✅ MongoDB connected successfully");
+  } catch (err) {
+    console.error("❌ MongoDB connection error:", err.message);
+    process.exit(1);
+  }
 }
 
 // ── Routes ──────────────────────────────────────────────────────────────────
@@ -97,23 +93,26 @@ app.get("/api/expenses", async (req, res) => {
       });
     }
 
-    let query = "SELECT * FROM expenses";
-    const params = [];
-    const conditions = [];
-
-    if (category && category !== "All") {
-      params.push(category);
-      conditions.push(`category = $${params.length}`);
-    }
+    const query = {};
+    if (category && category !== "All") query.category = category;
     if (month) {
-      params.push(month);
-      conditions.push(`TO_CHAR(expense_date, 'YYYY-MM') = $${params.length}`);
+       // match strings starting with 'YYYY-MM'
+       query.expense_date = { $regex: new RegExp("^" + month) };
     }
-    if (conditions.length) query += " WHERE " + conditions.join(" AND ");
-    query += " ORDER BY expense_date DESC, created_at DESC";
 
-    const result = await pool.query(query, params);
-    res.json({ success: true, data: result.rows });
+    const expenses = await Expense.find(query).sort({ expense_date: -1, created_at: -1 });
+    
+    // Map _id to id so frontend doesn't break
+    const formattedExpenses = expenses.map(e => ({
+      id: e._id,
+      description: e.description,
+      amount: e.amount,
+      category: e.category,
+      expense_date: e.expense_date,
+      created_at: e.created_at
+    }));
+
+    res.json({ success: true, data: formattedExpenses });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: err.message });
@@ -143,17 +142,23 @@ app.post("/api/expenses", async (req, res) => {
       return res.status(201).json({ success: true, data: newExpense });
     }
 
-    const result = await pool.query(
-      `INSERT INTO expenses (description, amount, category, expense_date)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [
-        description,
-        parseFloat(amount),
-        category || "Other",
-        expense_date || new Date().toISOString().split("T")[0],
-      ],
-    );
-    res.status(201).json({ success: true, data: result.rows[0] });
+    const newExpense = await Expense.create({
+      description,
+      amount: parseFloat(amount),
+      category: category || "Other",
+      expense_date: expense_date || new Date().toISOString().split("T")[0],
+    });
+
+    const formattedData = {
+      id: newExpense._id,
+      description: newExpense.description,
+      amount: newExpense.amount,
+      category: newExpense.category,
+      expense_date: newExpense.expense_date,
+      created_at: newExpense.created_at
+    };
+
+    res.status(201).json({ success: true, data: formattedData });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: err.message });
@@ -165,12 +170,12 @@ app.delete("/api/expenses/:id", async (req, res) => {
   try {
     if (isDev) {
       mockExpenses = mockExpenses.filter(
-        (e) => e.id !== parseInt(req.params.id),
+        (e) => String(e.id) !== String(req.params.id),
       );
       return res.json({ success: true });
     }
 
-    await pool.query("DELETE FROM expenses WHERE id = $1", [req.params.id]);
+    await Expense.findByIdAndDelete(req.params.id);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -215,39 +220,46 @@ app.get("/api/expenses/summary", async (req, res) => {
         data: {
           total,
           count: filtered.length,
-          byCategory: catBreakdown,
+          byCategory: catBreakdown.sort((a,b)=> b.total - a.total),
           dailyTrend: dailyTrendArray,
         },
       });
     }
 
-    const [totals, catBreakdown, dailyTrend] = await Promise.all([
-      pool.query(
-        `SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as count
-         FROM expenses WHERE TO_CHAR(expense_date,'YYYY-MM') = $1`,
-        [monthFilter],
-      ),
-      pool.query(
-        `SELECT category, COALESCE(SUM(amount),0) as total, COUNT(*) as count
-         FROM expenses WHERE TO_CHAR(expense_date,'YYYY-MM') = $1
-         GROUP BY category ORDER BY total DESC`,
-        [monthFilter],
-      ),
-      pool.query(
-        `SELECT TO_CHAR(expense_date,'DD') as day, SUM(amount) as total
-         FROM expenses WHERE TO_CHAR(expense_date,'YYYY-MM') = $1
-         GROUP BY day ORDER BY day`,
-        [monthFilter],
-      ),
+    // MongoDB Aggregations
+    const monthRegex = new RegExp("^" + monthFilter);
+
+    // 1. Total and count
+    const totalsAggr = await Expense.aggregate([
+      { $match: { expense_date: monthRegex } },
+      { $group: { _id: null, total: { $sum: "$amount" }, count: { $sum: 1 } } }
+    ]);
+    const totalData = totalsAggr[0] || { total: 0, count: 0 };
+
+    // 2. Category Breakdown
+    const catBreakdown = await Expense.aggregate([
+      { $match: { expense_date: monthRegex } },
+      { $group: { _id: "$category", total: { $sum: "$amount" }, count: { $sum: 1 } } },
+      { $project: { _id: 0, category: "$_id", total: 1, count: 1 } },
+      { $sort: { total: -1 } }
+    ]);
+
+    // 3. Daily trend
+    const dailyTrend = await Expense.aggregate([
+      { $match: { expense_date: monthRegex } },
+      { $addFields: { day: { $substr: ["$expense_date", 8, 2] } } }, // Extract DD from YYYY-MM-DD
+      { $group: { _id: "$day", total: { $sum: "$amount" } } },
+      { $project: { _id: 0, day: "$_id", total: 1 } },
+      { $sort: { day: 1 } }
     ]);
 
     res.json({
       success: true,
       data: {
-        total: parseFloat(totals.rows[0].total),
-        count: parseInt(totals.rows[0].count),
-        byCategory: catBreakdown.rows,
-        dailyTrend: dailyTrend.rows,
+        total: parseFloat(totalData.total) || 0,
+        count: parseInt(totalData.count) || 0,
+        byCategory: catBreakdown,
+        dailyTrend: dailyTrend,
       },
     });
   } catch (err) {
@@ -265,11 +277,8 @@ app.get("/api/settings/:key", async (req, res) => {
       });
     }
 
-    const result = await pool.query(
-      "SELECT value FROM settings WHERE key = $1",
-      [req.params.key],
-    );
-    res.json({ success: true, value: result.rows[0]?.value || null });
+    const doc = await Setting.findOne({ key: req.params.key });
+    res.json({ success: true, value: doc?.value || null });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -284,10 +293,10 @@ app.post("/api/settings", async (req, res) => {
       return res.json({ success: true });
     }
 
-    await pool.query(
-      `INSERT INTO settings (key, value) VALUES ($1, $2)
-       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
-      [key, String(value)],
+    await Setting.findOneAndUpdate(
+      { key },
+      { value: String(value), updated_at: Date.now() },
+      { upsert: true, new: true }
     );
     res.json({ success: true });
   } catch (err) {
@@ -343,7 +352,7 @@ app.get("*", (req, res) => {
     app.listen(PORT, () => {
       const mode = isDev
         ? "development (mock database)"
-        : "production (PostgreSQL)";
+        : "production (MongoDB)";
       console.log(`✅ Server running on http://localhost:${PORT} in ${mode}`);
     });
   } catch (err) {
